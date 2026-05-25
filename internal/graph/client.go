@@ -4,6 +4,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 	"github.com/quyenluc/assiter/internal/umodel"
@@ -51,7 +52,9 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 		"CREATE CONSTRAINT IF NOT EXISTS FOR (n:Variable) REQUIRE n.id IS UNIQUE",
 		"CREATE CONSTRAINT IF NOT EXISTS FOR (n:Import) REQUIRE n.id IS UNIQUE",
 
-		"CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.name)",
+		"CREATE CONSTRAINT IF NOT EXISTS FOR (n:Symbol) REQUIRE n.id IS UNIQUE",
+
+		"CREATE INDEX IF NOT EXISTS FOR (n:Symbol) ON (n.name)",
 		"CREATE INDEX IF NOT EXISTS FOR (n:Method) ON (n.name)",
 		"CREATE INDEX IF NOT EXISTS FOR (n:Struct) ON (n.name)",
 		"CREATE INDEX IF NOT EXISTS FOR (n:Interface) ON (n.name)",
@@ -65,66 +68,273 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
-// UpsertGraph writes all nodes and edges from a UModel Graph into Neo4j.
-// Uses MERGE to support incremental updates.
-func (c *Client) UpsertGraph(ctx context.Context, g *umodel.Graph) error {
+// GetFileChecksums returns a map of filePath → checksum for all File nodes
+// currently stored in Neo4j. Used by the pipeline to skip unchanged files.
+func (c *Client) GetFileChecksums(ctx context.Context) (map[string]string, error) {
 	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
 	defer session.Close(ctx)
 
-	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
-		for _, node := range g.Nodes {
-			if err := upsertNode(ctx, tx, node); err != nil {
-				return nil, err
-			}
-		}
-		for _, edge := range g.Edges {
-			if err := upsertEdge(ctx, tx, edge); err != nil {
-				return nil, err
-			}
-		}
-		return nil, nil
-	})
-	return err
-}
-
-func upsertNode(ctx context.Context, tx neo4j.ManagedTransaction, n *umodel.Node) error {
-	label := string(n.Type)
-	cql := fmt.Sprintf(`
-		MERGE (x:%s {id: $id})
-		SET x += $props
-	`, label)
-
-	props := map[string]any{
-		"name":      n.Name,
-		"language":  n.Language,
-		"filePath":  n.FilePath,
-		"startLine": n.StartLine,
-		"endLine":   n.EndLine,
-		"doc":       n.Doc,
-		"signature": n.Signature,
-		"receiver":  n.Receiver,
-		"alias":     n.Alias,
-		"checksum":  n.Checksum,
+	result, err := session.Run(ctx,
+		`MATCH (f:File) WHERE f.filePath IS NOT NULL AND f.checksum IS NOT NULL
+		 RETURN f.filePath AS path, f.checksum AS checksum`,
+		nil,
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	_, err := tx.Run(ctx, cql, map[string]any{"id": n.ID, "props": props})
-	return err
+	checksums := make(map[string]string)
+	for result.Next(ctx) {
+		rec := result.Record()
+		path, _ := rec.Get("path")
+		cs, _ := rec.Get("checksum")
+		if p, ok := path.(string); ok {
+			if h, ok := cs.(string); ok {
+				checksums[p] = h
+			}
+		}
+	}
+	return checksums, result.Err()
 }
 
-func upsertEdge(ctx context.Context, tx neo4j.ManagedTransaction, e *umodel.Edge) error {
-	cql := fmt.Sprintf(`
-		MATCH (a {id: $fromId}), (b {id: $toId})
-		MERGE (a)-[r:%s]->(b)
-	`, string(e.Type))
 
-	_, err := tx.Run(ctx, cql, map[string]any{
-		"fromId": e.FromID,
-		"toId":   e.ToID,
-	})
-	return err
+// UpsertGraph writes all nodes and edges from a UModel Graph into Neo4j.
+// Uses UNWIND batch writes (500 per tx) to handle large graphs efficiently.
+func (c *Client) UpsertGraph(ctx context.Context, g *umodel.Graph) error {
+	slog.Info("writing nodes to Neo4j", "count", len(g.Nodes))
+	if err := c.upsertNodesBatched(ctx, g.Nodes); err != nil {
+		return fmt.Errorf("upserting nodes: %w", err)
+	}
+	slog.Info("nodes written, writing edges", "count", len(g.Edges))
+	if err := c.upsertEdgesBatched(ctx, g.Edges); err != nil {
+		return fmt.Errorf("upserting edges: %w", err)
+	}
+	return nil
 }
 
-// SearchNodes finds nodes by name (case-insensitive, partial match).
+const batchSize = 500
+
+func (c *Client) upsertNodesBatched(ctx context.Context, nodes []*umodel.Node) error {
+	// Group ALL nodes by label up-front; batch within each label group.
+	byLabel := make(map[string][]*umodel.Node)
+	for _, n := range nodes {
+		byLabel[string(n.Type)] = append(byLabel[string(n.Type)], n)
+	}
+
+	for label, group := range byLabel {
+		total := len(group)
+		for i := 0; i < total; i += batchSize {
+			end := i + batchSize
+			if end > total {
+				end = total
+			}
+			rows := make([]map[string]any, 0, end-i)
+			for _, n := range group[i:end] {
+				rows = append(rows, map[string]any{
+					"id":        n.ID,
+					"name":      n.Name,
+					"language":  n.Language,
+					"filePath":  n.FilePath,
+					"startLine": n.StartLine,
+					"endLine":   n.EndLine,
+					"doc":       n.Doc,
+					"signature": n.Signature,
+					"receiver":  n.Receiver,
+					"alias":     n.Alias,
+					"checksum":  n.Checksum,
+				})
+			}
+
+			// ON CREATE: write all props for new nodes.
+			// ON MATCH:  skip write when checksum unchanged (file content didn't change).
+			cql := fmt.Sprintf(`
+				UNWIND $rows AS row
+				MERGE (x:%s {id: row.id})
+				ON CREATE SET x = row
+				ON MATCH SET x += CASE WHEN x.checksum <> row.checksum THEN row ELSE {} END
+			`, label)
+
+			session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
+			_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+				_, err := tx.Run(ctx, cql, map[string]any{"rows": rows})
+				return nil, err
+			})
+			session.Close(ctx)
+			if err != nil {
+				return fmt.Errorf("nodes label=%s batch=%d/%d: %w", label, i/batchSize+1, (total+batchSize-1)/batchSize, err)
+			}
+			slog.Info("nodes batch done", "label", label,
+				"batch", fmt.Sprintf("%d/%d", i/batchSize+1, (total+batchSize-1)/batchSize))
+		}
+	}
+	return nil
+}
+
+func (c *Client) upsertEdgesBatched(ctx context.Context, edges []*umodel.Edge) error {
+	// Group by (edgeType, fromLabel, toLabel) so MATCH can use constraint indexes.
+	type edgeKey struct{ edgeType, fromType, toType string }
+	byKey := make(map[edgeKey][]*umodel.Edge)
+	for _, e := range edges {
+		k := edgeKey{string(e.Type), string(e.FromType), string(e.ToType)}
+		byKey[k] = append(byKey[k], e)
+	}
+
+	for k, group := range byKey {
+		total := len(group)
+
+		// Use labeled MATCH when type is known — this hits the constraint index.
+		fromMatch := "a"
+		if k.fromType != "" {
+			fromMatch = fmt.Sprintf("a:%s", k.fromType)
+		}
+		toMatch := "b"
+		if k.toType != "" {
+			toMatch = fmt.Sprintf("b:%s", k.toType)
+		}
+		cql := fmt.Sprintf(`
+			UNWIND $rows AS row
+			MATCH (%s {id: row.fromId}), (%s {id: row.toId})
+			MERGE (a)-[r:%s]->(b)
+		`, fromMatch, toMatch, k.edgeType)
+
+		for i := 0; i < total; i += batchSize {
+			end := i + batchSize
+			if end > total {
+				end = total
+			}
+			rows := make([]map[string]any, 0, end-i)
+			for _, e := range group[i:end] {
+				rows = append(rows, map[string]any{"fromId": e.FromID, "toId": e.ToID})
+			}
+
+			session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
+			_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+				_, err := tx.Run(ctx, cql, map[string]any{"rows": rows})
+				return nil, err
+			})
+			session.Close(ctx)
+			if err != nil {
+				return fmt.Errorf("edges type=%s from=%s to=%s batch=%d: %w",
+					k.edgeType, k.fromType, k.toType, i/batchSize+1, err)
+			}
+			slog.Info("edges batch done",
+				"type", k.edgeType,
+				"from", k.fromType, "to", k.toType,
+				"batch", fmt.Sprintf("%d/%d", i/batchSize+1, (total+batchSize-1)/batchSize),
+			)
+		}
+	}
+	return nil
+}
+
+// GetFileStatus returns the stored checksum + node counts for a specific file path.
+// Returns nil if the file has not been ingested yet.
+func (c *Client) GetFileStatus(ctx context.Context, filePath string) (*FileStatus, error) {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
+	defer session.Close(ctx)
+
+	// Get file node
+	result, err := session.Run(ctx,
+		`MATCH (f:File {filePath: $path})
+		 OPTIONAL MATCH (f)-[]->(child)
+		 RETURN f.filePath AS path, f.checksum AS checksum, f.name AS name,
+		        count(child) AS childCount`,
+		map[string]any{"path": filePath},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !result.Next(ctx) {
+		return nil, nil // not ingested
+	}
+	rec := result.Record()
+
+	get := func(k string) string {
+		v, _ := rec.Get(k)
+		if v == nil {
+			return ""
+		}
+		return fmt.Sprintf("%v", v)
+	}
+	childCount := int64(0)
+	if v, ok := rec.Get("childCount"); ok {
+		if n, ok := v.(int64); ok {
+			childCount = n
+		}
+	}
+
+	return &FileStatus{
+		FilePath:   get("path"),
+		Name:       get("name"),
+		Checksum:   get("checksum"),
+		ChildNodes: int(childCount),
+	}, result.Err()
+}
+
+// FileStatus holds what the graph knows about an ingested source file.
+type FileStatus struct {
+	FilePath   string `json:"filePath"`
+	Name       string `json:"name"`
+	Checksum   string `json:"checksum"`
+	ChildNodes int    `json:"childNodes"` // functions, methods, structs, etc. linked from this file
+}
+
+// SearchCallers finds all functions/methods that call a symbol matching the given name.
+func (c *Client) SearchCallers(ctx context.Context, name string) ([]*CallerEntry, error) {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
+	defer session.Close(ctx)
+
+	cql := `
+		MATCH (caller)-[:CALLS]->(sym:Symbol)
+		WHERE toLower(sym.name) CONTAINS toLower($name)
+		RETURN caller.id AS id, labels(caller)[0] AS type, caller.name AS name,
+		       caller.language AS language, caller.filePath AS filePath,
+		       caller.startLine AS startLine, sym.name AS callee
+		ORDER BY filePath, startLine
+		LIMIT 100
+	`
+	result, err := session.Run(ctx, cql, map[string]any{"name": name})
+	if err != nil {
+		return nil, err
+	}
+
+	var callers []*CallerEntry
+	for result.Next(ctx) {
+		rec := result.Record()
+		get := func(k string) string {
+			v, _ := rec.Get(k)
+			if v == nil {
+				return ""
+			}
+			return fmt.Sprintf("%v", v)
+		}
+		startLine := 0
+		if v, ok := rec.Get("startLine"); ok {
+			if i, ok := v.(int64); ok {
+				startLine = int(i)
+			}
+		}
+		callers = append(callers, &CallerEntry{
+			Node: &umodel.Node{
+				ID:        get("id"),
+				Type:      umodel.NodeType(get("type")),
+				Name:      get("name"),
+				Language:  get("language"),
+				FilePath:  get("filePath"),
+				StartLine: startLine,
+			},
+			Callee: get("callee"),
+		})
+	}
+	return callers, result.Err()
+}
+
+// CallerEntry pairs a caller node with the symbol name it calls.
+type CallerEntry struct {
+	Node   *umodel.Node `json:"node"`
+	Callee string       `json:"callee"`
+}
+
 func (c *Client) SearchNodes(ctx context.Context, name string, nodeTypes []string) ([]*umodel.Node, error) {
 	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
 	defer session.Close(ctx)

@@ -38,7 +38,11 @@ func main() {
 	p := parser.New(cfg.Parser.Languages)
 	n := normalizer.New()
 	pipe := ingestion.New(p, n, g)
-	a := agent.New(cfg.OpenAI, g)
+	a, err := agent.New(cfg.LLM, g)
+	if err != nil {
+		slog.Error("failed to create agent", "err", err)
+		os.Exit(1)
+	}
 
 	srv := api.New(cfg, pipe, g, a)
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)

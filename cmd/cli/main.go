@@ -53,7 +53,10 @@ func loadDeps() (*config.Config, *graph.Client, *agent.Agent, *ingestion.Pipelin
 		return nil, nil, nil, nil, fmt.Errorf("neo4j: %w", err)
 	}
 
-	a := agent.New(cfg.OpenAI, g)
+	a, err := agent.New(cfg.LLM, g)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("agent: %w", err)
+	}
 	p := parser.New(cfg.Parser.Languages)
 	n := normalizer.New()
 	pipe := ingestion.New(p, n, g)
@@ -65,6 +68,7 @@ func loadDeps() (*config.Config, *graph.Client, *agent.Agent, *ingestion.Pipelin
 
 func ingestCmd() *cobra.Command {
 	var exclude []string
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "ingest <path>",
 		Short: "Parse and ingest a code repository into the knowledge graph",
@@ -86,19 +90,21 @@ func ingestCmd() *cobra.Command {
 				ex = cfg.Parser.Exclude
 			}
 
-			result, err := pipe.Run(ctx, ingestion.IngestOptions{Dir: args[0], Exclude: ex})
+			result, err := pipe.Run(ctx, ingestion.IngestOptions{Dir: args[0], Exclude: ex, Force: force})
 			if err != nil {
 				return err
 			}
 
 			fmt.Printf("✅ Ingestion complete\n")
 			fmt.Printf("   Files processed : %d\n", result.FilesProcessed)
-			fmt.Printf("   Nodes created   : %d\n", result.NodesCreated)
-			fmt.Printf("   Edges created   : %d\n", result.EdgesCreated)
+			fmt.Printf("   Files skipped   : %d (unchanged)\n", result.FilesSkipped)
+			fmt.Printf("   Nodes written   : %d\n", result.NodesWritten)
+			fmt.Printf("   Edges written   : %d\n", result.EdgesWritten)
 			return nil
 		},
 	}
 	cmd.Flags().StringSliceVar(&exclude, "exclude", nil, "directories to exclude (comma-separated)")
+	cmd.Flags().BoolVar(&force, "force", false, "re-ingest all files, ignoring cached checksums")
 	return cmd
 }
 
@@ -141,7 +147,7 @@ func graphCmd() *cobra.Command {
 		Use:   "graph",
 		Short: "Interact with the knowledge graph",
 	}
-	cmd.AddCommand(graphStatsCmd(), graphSearchCmd())
+	cmd.AddCommand(graphStatsCmd(), graphSearchCmd(), graphFileCmd(), graphCallersCmd())
 	return cmd
 }
 
@@ -197,6 +203,67 @@ func graphSearchCmd() *cobra.Command {
 		},
 	}
 }
+
+func graphFileCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "file <path>",
+		Short: "Check if a source file has been ingested and show its status",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, g, _, _, err := loadDeps()
+			if err != nil {
+				return err
+			}
+			defer g.Close(context.Background())
+
+			status, err := g.GetFileStatus(context.Background(), args[0])
+			if err != nil {
+				return err
+			}
+			if status == nil {
+				fmt.Printf("❌ Not ingested: %s\n", args[0])
+				return nil
+			}
+			fmt.Printf("✅ Ingested: %s\n", status.FilePath)
+			fmt.Printf("   Name       : %s\n", status.Name)
+			fmt.Printf("   Checksum   : %s\n", status.Checksum)
+			fmt.Printf("   Child nodes: %d (functions, methods, structs, etc.)\n", status.ChildNodes)
+			return nil
+		},
+	}
+}
+
+
+func graphCallersCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "callers <symbol>",
+		Short: "Find all functions/methods that call a given symbol",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, g, _, _, err := loadDeps()
+			if err != nil {
+				return err
+			}
+			defer g.Close(context.Background())
+
+			callers, err := g.SearchCallers(context.Background(), args[0])
+			if err != nil {
+				return err
+			}
+			if len(callers) == 0 {
+				fmt.Printf("No callers found for %q\n", args[0])
+				return nil
+			}
+			fmt.Printf("Callers of %q (%d results):\n\n", args[0], len(callers))
+			for _, c := range callers {
+				fmt.Printf("  [%s] %s  →  %s\n", c.Node.Type, c.Node.Name, c.Callee)
+				fmt.Printf("         %s:%d\n", c.Node.FilePath, c.Node.StartLine)
+			}
+			return nil
+		},
+	}
+}
+
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

@@ -80,7 +80,44 @@ func precedingComment(n *sitter.Node, source []byte) string {
 	return ""
 }
 
-// startLine returns 1-based line number of a node.
+// collectCalls walks the subtree rooted at n and returns unique callee names
+// for every call expression found. It handles:
+//   - direct calls:     foo(...)         → "foo"
+//   - attribute calls:  obj.method(...)  → "method"
+func collectCalls(n *sitter.Node, source []byte) []string {
+	seen := make(map[string]struct{})
+	var walk func(*sitter.Node)
+	walk = func(cur *sitter.Node) {
+		if cur.Type() == "call" {
+			fn := cur.ChildByFieldName("function")
+			if fn != nil {
+				var name string
+				switch fn.Type() {
+				case "identifier":
+					name = nodeText(fn, source)
+				case "attribute":
+					if attr := fn.ChildByFieldName("attribute"); attr != nil {
+						name = nodeText(attr, source)
+					}
+				}
+				if name != "" {
+					seen[name] = struct{}{}
+				}
+			}
+		}
+		for i := uint32(0); i < cur.ChildCount(); i++ {
+			walk(cur.Child(int(i)))
+		}
+	}
+	walk(n)
+
+	names := make([]string, 0, len(seen))
+	for k := range seen {
+		names = append(names, k)
+	}
+	return names
+}
+
 func startLine(n *sitter.Node) int {
 	return int(n.StartPoint().Row) + 1
 }

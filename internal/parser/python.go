@@ -50,7 +50,6 @@ func pythonVisitor(n *sitter.Node, source []byte) []*RawNode {
 		}
 		kind := "function"
 		receiver := ""
-		// If parent is a class_definition body, it's a method
 		if parent := n.Parent(); parent != nil {
 			if gp := parent.Parent(); gp != nil && gp.Type() == "class_definition" {
 				kind = "method"
@@ -59,6 +58,18 @@ func pythonVisitor(n *sitter.Node, source []byte) []*RawNode {
 				}
 			}
 		}
+
+		// Collect all function calls made inside this function body.
+		var callChildren []*RawNode
+		if body := childByField(n, "body"); body != nil {
+			for _, callee := range collectCalls(body, source) {
+				callChildren = append(callChildren, &RawNode{
+					Kind: "call",
+					Name: callee,
+				})
+			}
+		}
+
 		return []*RawNode{{
 			Kind:      kind,
 			Name:      nodeText(nameNode, source),
@@ -66,6 +77,7 @@ func pythonVisitor(n *sitter.Node, source []byte) []*RawNode {
 			EndLine:   endLine(n),
 			Doc:       extractPythonDocstring(n, source),
 			Properties: map[string]string{"receiver": receiver},
+			Children:  callChildren,
 		}}
 	}
 	return nil

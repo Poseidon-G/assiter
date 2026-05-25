@@ -34,7 +34,14 @@ REST API + CLI
 
 ### Configure
 
-Copy and edit `assiter.yaml`:
+Copy the example and edit your local `assiter.yaml`:
+```bash
+cp assiter.example.yaml assiter.yaml
+```
+
+`assiter.yaml` is local-only and ignored by Git.
+
+Example (`assiter.example.yaml`):
 ```yaml
 neo4j:
   uri: "bolt://localhost:7687"
@@ -124,7 +131,8 @@ assiter/
 │   ├── ingestion/           # End-to-end pipeline
 │   ├── agent/               # AI agent + OpenAI integration
 │   └── api/                 # Gin REST handlers
-├── pkg/config/              # YAML + env config (Viper)
+├── assiter.example.yaml     # Safe config template for sharing
+├── assiter.yaml             # Local config (gitignored)
 ├── assiter.yaml             # Default config
 └── go.mod
 ```

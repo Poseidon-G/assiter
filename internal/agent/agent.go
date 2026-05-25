@@ -1,4 +1,6 @@
 // Package agent provides an AI agent that uses the knowledge graph as context.
+// The agent is provider-agnostic: swap OpenAI, GitHub Copilot, or any
+// OpenAI-compatible endpoint (Ollama, Mistral, Azure OpenAI, …) via config.
 package agent
 
 import (
@@ -6,30 +8,48 @@ import (
 	"fmt"
 	"strings"
 
-	openai "github.com/sashabaranov/go-openai"
 	"github.com/quyenluc/assiter/internal/graph"
 	"github.com/quyenluc/assiter/pkg/config"
 )
 
-// Agent uses the knowledge graph to provide AI-powered code understanding.
-type Agent struct {
-	client *openai.Client
-	graph  *graph.Client
-	model  string
+// ChatMessage is a single turn in a conversation sent to the LLM.
+type ChatMessage struct {
+	Role    string // "system" | "user" | "assistant"
+	Content string
 }
 
-// New creates an Agent using the provided config and graph client.
-func New(cfg config.OpenAIConfig, g *graph.Client) *Agent {
-	clientCfg := openai.DefaultConfig(cfg.APIKey)
-	if cfg.BaseURL != "" {
-		clientCfg.BaseURL = cfg.BaseURL
-	}
-	return &Agent{
-		client: openai.NewClientWithConfig(clientCfg),
-		graph:  g,
-		model:  cfg.Model,
-	}
+// LLMProvider is the interface every AI backend must implement.
+// Adding a new backend only requires implementing these two methods.
+type LLMProvider interface {
+	// Name returns a human-readable label (e.g. "openai", "copilot", "ollama").
+	Name() string
+	// Ask sends a conversation to the LLM and returns the assistant's reply.
+	Ask(ctx context.Context, messages []ChatMessage) (string, error)
 }
+
+// Agent uses the knowledge graph to provide AI-powered code understanding.
+type Agent struct {
+	llm   LLMProvider
+	graph *graph.Client
+}
+
+// New creates an Agent wired to the LLM provider selected in cfg.
+func New(cfg config.LLMConfig, g *graph.Client) (*Agent, error) {
+	p, err := NewLLMProvider(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Agent{llm: p, graph: g}, nil
+}
+
+// NewWithProvider creates an Agent with an explicitly supplied LLMProvider.
+// Useful for testing or when you construct the provider yourself.
+func NewWithProvider(p LLMProvider, g *graph.Client) *Agent {
+	return &Agent{llm: p, graph: g}
+}
+
+// ProviderName returns the name of the active LLM provider.
+func (a *Agent) ProviderName() string { return a.llm.Name() }
 
 // QueryRequest is the input to a knowledge-graph-augmented AI query.
 type QueryRequest struct {
@@ -40,15 +60,15 @@ type QueryRequest struct {
 
 // QueryResponse contains the AI's answer and the graph context used.
 type QueryResponse struct {
-	Answer      string `json:"answer"`
+	Answer       string `json:"answer"`
 	GraphContext string `json:"graph_context,omitempty"`
+	Provider     string `json:"provider"`
 }
 
 // Query answers a question using graph context retrieved from Neo4j.
 func (a *Agent) Query(ctx context.Context, req QueryRequest) (*QueryResponse, error) {
 	graphCtx, err := a.buildGraphContext(ctx, req.Question, req.Symbol)
 	if err != nil {
-		// degrade gracefully: proceed without graph context
 		graphCtx = "(graph context unavailable)"
 	}
 
@@ -58,32 +78,21 @@ Use this context to answer the user's question precisely.
 When explaining code impact, reference specific symbols from the graph.
 Always mention which files/packages are affected by proposed changes.`
 
-	userPrompt := fmt.Sprintf(`## Knowledge Graph Context
-%s
+	userPrompt := fmt.Sprintf("## Knowledge Graph Context\n%s\n\n## Question\n%s",
+		graphCtx, req.Question)
 
-## Question
-%s`, graphCtx, req.Question)
-
-	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: a.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
-		},
-		Temperature: 0.2,
+	answer, err := a.llm.Ask(ctx, []ChatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("openai completion: %w", err)
-	}
-
-	answer := ""
-	if len(resp.Choices) > 0 {
-		answer = resp.Choices[0].Message.Content
+		return nil, fmt.Errorf("llm %s: %w", a.llm.Name(), err)
 	}
 
 	return &QueryResponse{
-		Answer:      answer,
+		Answer:       answer,
 		GraphContext: graphCtx,
+		Provider:     a.llm.Name(),
 	}, nil
 }
 
@@ -91,13 +100,11 @@ Always mention which files/packages are affected by proposed changes.`
 func (a *Agent) buildGraphContext(ctx context.Context, question, symbol string) (string, error) {
 	var parts []string
 
-	// Get graph stats for overview
 	stats, err := a.graph.Stats(ctx)
 	if err == nil {
 		parts = append(parts, formatStats(stats))
 	}
 
-	// Search by symbol name if provided, otherwise by keywords from question
 	searchTerm := symbol
 	if searchTerm == "" {
 		searchTerm = extractKeyword(question)

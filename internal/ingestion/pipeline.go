@@ -3,6 +3,7 @@ package ingestion
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 
@@ -27,13 +28,15 @@ func New(p *parser.Parser, n *normalizer.Normalizer, g *graph.Client) *Pipeline 
 type IngestOptions struct {
 	Dir     string
 	Exclude []string
+	Force   bool // skip checksum dedup and re-ingest all files
 }
 
 // IngestResult summarises the outcome of an ingestion run.
 type IngestResult struct {
 	FilesProcessed int
-	NodesCreated   int
-	EdgesCreated   int
+	FilesSkipped   int // files whose content hasn't changed since last ingestion
+	NodesWritten   int
+	EdgesWritten   int
 	Errors         []string
 }
 
@@ -45,22 +48,68 @@ func (p *Pipeline) Run(ctx context.Context, opts IngestOptions) (*IngestResult, 
 	if err != nil {
 		return nil, fmt.Errorf("parsing directory %s: %w", opts.Dir, err)
 	}
-
 	slog.Info("parsing complete", "files", len(results))
 
-	g := p.normalizer.NormalizeAll(results)
+	// Fetch checksums of files already stored in Neo4j.
+	// If this fails (e.g. first run, empty graph) we simply ingest everything.
+	existingChecksums := map[string]string{}
+	if !opts.Force {
+		existingChecksums, err = p.graph.GetFileChecksums(ctx)
+		if err != nil {
+			slog.Warn("could not fetch existing checksums, ingesting all files", "err", err)
+			existingChecksums = map[string]string{}
+		}
+	}
 
+	// Filter to only files that are new or whose content has changed.
+	var changed []*parser.ParseResult
+	skipped := 0
+	for _, r := range results {
+		cs := fileChecksum(r.Source)
+		if existingChecksums[r.FilePath] == cs {
+			skipped++
+			continue
+		}
+		changed = append(changed, r)
+	}
+	slog.Info("change detection complete",
+		"total", len(results),
+		"changed", len(changed),
+		"skipped_unchanged", skipped,
+	)
+
+	if len(changed) == 0 {
+		slog.Info("nothing to ingest — all files are up to date")
+		return &IngestResult{
+			FilesProcessed: len(results),
+			FilesSkipped:   skipped,
+		}, nil
+	}
+
+	g := p.normalizer.NormalizeAll(changed)
 	slog.Info("normalization complete", "nodes", len(g.Nodes), "edges", len(g.Edges))
 
+	slog.Info("storing graph", "nodes", len(g.Nodes), "edges", len(g.Edges))
 	if err := p.graph.UpsertGraph(ctx, g); err != nil {
 		return nil, fmt.Errorf("upserting graph: %w", err)
 	}
 
-	slog.Info("ingestion complete", "nodes", len(g.Nodes), "edges", len(g.Edges))
+	slog.Info("ingestion complete",
+		"files_changed", len(changed),
+		"files_skipped", skipped,
+		"nodes", len(g.Nodes),
+		"edges", len(g.Edges),
+	)
 
 	return &IngestResult{
 		FilesProcessed: len(results),
-		NodesCreated:   len(g.Nodes),
-		EdgesCreated:   len(g.Edges),
+		FilesSkipped:   skipped,
+		NodesWritten:   len(g.Nodes),
+		EdgesWritten:   len(g.Edges),
 	}, nil
+}
+
+func fileChecksum(src []byte) string {
+	h := sha256.Sum256(src)
+	return fmt.Sprintf("%x", h[:])
 }

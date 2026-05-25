@@ -1,0 +1,38 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+neo4j:
+  uri: "bolt://localhost:7687"
+  username: "neo4j"
+  password: "your-neo4j-password"
+  database: "neo4j"
+
+# LLM provider configuration.
+# provider: "openai"   → OpenAI API. api_key = OpenAI key.
+# provider: "copilot"  → GitHub Copilot API. api_key = GitHub personal access token.
+# provider: "custom"   → Any OpenAI-compatible endpoint (Ollama, Mistral, Azure…).
+#                        Set base_url to the endpoint root (e.g. http://localhost:11434/v1).
+llm:
+  provider: "openai"    # openai | copilot | custom
+  api_key: "your-api-key" # Set via ASSITER_LLM__API_KEY env var
+  base_url: ""          # Leave empty for openai/copilot defaults
+  model: "gpt-4o"
+  name: ""              # Optional display name for "custom" provider
+
+parser:
+  languages:
+    - go
+    - python
+    - typescript
+    - java
+    - rust
+    - cpp
+  exclude:
+    - vendor
+    - node_modules
+    - .git
+    - dist
+    - build
+    - __pycache__
+    - target

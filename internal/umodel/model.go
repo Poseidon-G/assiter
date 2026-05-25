@@ -14,6 +14,7 @@ const (
 	NodeInterface NodeType = "Interface"
 	NodeVariable  NodeType = "Variable"
 	NodeImport    NodeType = "Import"
+	NodeSymbol    NodeType = "Symbol" // named symbol referenced via a call (may or may not be defined in-repo)
 )
 
 // EdgeType identifies the kind of a relationship between nodes.
@@ -48,9 +49,11 @@ type Node struct {
 
 // Edge represents a directed relationship between two nodes.
 type Edge struct {
-	FromID     string            `json:"fromId"`
-	ToID       string            `json:"toId"`
-	Type       EdgeType          `json:"type"`
+	FromID   string            `json:"fromId"`
+	ToID     string            `json:"toId"`
+	Type     EdgeType          `json:"type"`
+	FromType NodeType          `json:"fromType,omitempty"` // label of the source node — enables indexed MATCH
+	ToType   NodeType          `json:"toType,omitempty"`   // label of the target node — enables indexed MATCH
 	Properties map[string]string `json:"properties,omitempty"`
 }
 

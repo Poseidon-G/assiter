@@ -14,19 +14,23 @@ const (
 	NodeInterface NodeType = "Interface"
 	NodeVariable  NodeType = "Variable"
 	NodeImport    NodeType = "Import"
-	NodeSymbol    NodeType = "Symbol" // named symbol referenced via a call (may or may not be defined in-repo)
+	NodeSymbol    NodeType = "Symbol"    // named symbol referenced via a call (may or may not be defined in-repo)
+	NodeCommit    NodeType = "Commit"    // a git commit that touched source files
+	NodeTicket    NodeType = "Ticket"    // a ticket/issue ID extracted from a commit message
 )
 
 // EdgeType identifies the kind of a relationship between nodes.
 type EdgeType string
 
 const (
-	EdgeContains  EdgeType = "CONTAINS"
-	EdgeCalls     EdgeType = "CALLS"
+	EdgeContains   EdgeType = "CONTAINS"
+	EdgeCalls      EdgeType = "CALLS"
 	EdgeImplements EdgeType = "IMPLEMENTS"
-	EdgeImports   EdgeType = "IMPORTS"
-	EdgeDependsOn EdgeType = "DEPENDS_ON"
-	EdgeDefines   EdgeType = "DEFINES"
+	EdgeImports    EdgeType = "IMPORTS"
+	EdgeDependsOn  EdgeType = "DEPENDS_ON"
+	EdgeDefines    EdgeType = "DEFINES"
+	EdgeHasCommit  EdgeType = "HAS_COMMIT"       // File → Commit
+	EdgeMentions   EdgeType = "MENTIONS_TICKET"  // Commit → Ticket
 )
 
 // Node represents a single entity in the knowledge graph.
@@ -49,12 +53,15 @@ type Node struct {
 
 // Edge represents a directed relationship between two nodes.
 type Edge struct {
-	FromID   string            `json:"fromId"`
-	ToID     string            `json:"toId"`
-	Type     EdgeType          `json:"type"`
-	FromType NodeType          `json:"fromType,omitempty"` // label of the source node — enables indexed MATCH
-	ToType   NodeType          `json:"toType,omitempty"`   // label of the target node — enables indexed MATCH
+	FromID     string            `json:"fromId"`
+	ToID       string            `json:"toId"`
+	Type       EdgeType          `json:"type"`
+	FromType   NodeType          `json:"fromType,omitempty"` // label of the source node — enables indexed MATCH
+	ToType     NodeType          `json:"toType,omitempty"`   // label of the target node — enables indexed MATCH
 	Properties map[string]string `json:"properties,omitempty"`
+	// IntLists stores integer list properties (e.g., changed line ranges on HAS_COMMIT edges).
+	// Values are stored as flat alternating pairs: [start1, end1, start2, end2, ...]
+	IntLists   map[string][]int64 `json:"intLists,omitempty"`
 }
 
 // Graph holds all extracted nodes and edges for a repository or file.

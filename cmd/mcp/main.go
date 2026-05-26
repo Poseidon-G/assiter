@@ -24,6 +24,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/quyenluc/assiter/internal/gitlog"
 	"github.com/quyenluc/assiter/internal/graph"
 	"github.com/quyenluc/assiter/internal/ingestion"
 	"github.com/quyenluc/assiter/internal/normalizer"
@@ -282,6 +283,67 @@ func registerTools(s *server.MCPServer, g *graph.Client, pipe *ingestion.Pipelin
 				return mcp.NewToolResultText("No nodes found for \"" + name + "\". Run ingest first."), nil
 			}
 			return mcp.NewToolResultText(toMermaid(vg)), nil
+		},
+	)
+
+	// ── git_ingest ────────────────────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("git_ingest",
+			mcp.WithDescription("Ingest git commit history for a repository directory, linking commits and ticket IDs to existing File nodes in the knowledge graph."),
+			mcp.WithString("dir", mcp.Required(), mcp.Description("Absolute path to the git repository root")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			dir := req.GetString("dir", "")
+			if dir == "" {
+				return mcp.NewToolResultError("dir is required"), nil
+			}
+			result, err := gitlog.Ingest(ctx, dir, g)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return jsonResult(map[string]any{
+				"commits_ingested":   result.CommitsIngested,
+				"tickets_linked":     result.TicketsLinked,
+				"file_links_created": result.FileLinksCreated,
+			})
+		},
+	)
+
+	// ── search_by_ticket ─────────────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("search_by_ticket",
+			mcp.WithDescription("Search commits, files, and functions by keyword — works with ticket IDs (e.g. '3581', 'PROJ-123') AND plain commit message keywords (e.g. 'authentication', 'fix login'). Commits without a ticket ID are also matched if their message contains the keyword."),
+			mcp.WithString("ticket_id", mcp.Required(), mcp.Description("Ticket ID or any keyword to search in commit messages, e.g. '3581', 'PROJ-123', 'fix login'")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			ticketID := req.GetString("ticket_id", "")
+			if ticketID == "" {
+				return mcp.NewToolResultError("ticket_id is required"), nil
+			}
+			impact, err := g.SearchByTicket(ctx, ticketID)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return jsonResult(impact)
+		},
+	)
+
+	// ── get_function_history ─────────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("get_function_history",
+			mcp.WithDescription("Get the git commit history for a named function or method — shows every commit that touched the file containing this function, with ticket IDs extracted from commit messages. Useful to understand how a function evolved over time."),
+			mcp.WithString("function_name", mcp.Required(), mcp.Description("Function or method name to look up")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			fnName := req.GetString("function_name", "")
+			if fnName == "" {
+				return mcp.NewToolResultError("function_name is required"), nil
+			}
+			histories, err := g.GetFunctionHistory(ctx, fnName)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return jsonResult(histories)
 		},
 	)
 }

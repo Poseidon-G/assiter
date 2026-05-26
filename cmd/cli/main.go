@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/quyenluc/assiter/internal/agent"
 	"github.com/quyenluc/assiter/internal/api"
+	"github.com/quyenluc/assiter/internal/gitlog"
 	"github.com/quyenluc/assiter/internal/graph"
 	"github.com/quyenluc/assiter/internal/ingestion"
 	"github.com/quyenluc/assiter/internal/normalizer"
@@ -34,6 +35,7 @@ then exposes it to AI agents for context-aware code understanding.`,
 		queryCmd(),
 		graphCmd(),
 		serveCmd(),
+		gitIngestCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -147,7 +149,7 @@ func graphCmd() *cobra.Command {
 		Use:   "graph",
 		Short: "Interact with the knowledge graph",
 	}
-	cmd.AddCommand(graphStatsCmd(), graphSearchCmd(), graphFileCmd(), graphCallersCmd())
+	cmd.AddCommand(graphStatsCmd(), graphSearchCmd(), graphFileCmd(), graphCallersCmd(), graphTicketCmd(), graphFunctionHistoryCmd())
 	return cmd
 }
 
@@ -292,6 +294,128 @@ func serveCmd() *cobra.Command {
 			srv := api.New(cfg, pipe, g, a)
 			fmt.Printf("🚀 Assiter server running on %s:%d\n", cfg.Server.Host, cfg.Server.Port)
 			return srv.Run()
+		},
+	}
+}
+
+// --- git-ingest command ---
+
+func gitIngestCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "git-ingest <dir>",
+		Short: "Ingest git commit history for a repository",
+		Long:  "Extracts git log and links commits + ticket IDs to existing File nodes in the graph.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, g, _, _, err := loadDeps()
+			_ = cfg
+			if err != nil {
+				return err
+			}
+			defer g.Close(context.Background())
+
+			if err := g.EnsureSchema(context.Background()); err != nil {
+				return fmt.Errorf("schema: %w", err)
+			}
+
+			result, err := gitlog.Ingest(context.Background(), args[0], g)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("✅ Git ingestion complete\n")
+			fmt.Printf("   Commits ingested : %d\n", result.CommitsIngested)
+			fmt.Printf("   Tickets linked   : %d\n", result.TicketsLinked)
+			fmt.Printf("   File links       : %d\n", result.FileLinksCreated)
+			return nil
+		},
+	}
+}
+
+// --- graph ticket command ---
+
+func graphTicketCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ticket <keyword>",
+		Short: "Show all files and functions touched by a commit keyword or ticket ID",
+		Long: `Searches commit messages for the given keyword.
+Works with structured ticket IDs (e.g. 3581, PROJ-123) and plain keywords
+(e.g. "authentication", "fix login"). Commits without a ticket ID are also
+matched if their message contains the keyword.`,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, g, _, _, err := loadDeps()
+			if err != nil {
+				return err
+			}
+			defer g.Close(context.Background())
+
+			impact, err := g.SearchByTicket(context.Background(), args[0])
+			if err != nil {
+				return err
+			}
+			if len(impact.Commits) == 0 {
+				fmt.Printf("No commits found for ticket %q\n", args[0])
+				return nil
+			}
+
+			fmt.Printf("🎫 Ticket: %s\n\n", impact.TicketID)
+
+			fmt.Printf("📦 Commits (%d):\n", len(impact.Commits))
+			for _, c := range impact.Commits {
+				fmt.Printf("  [%s] %s  — %s  (%s)\n",
+					truncate(c.Hash, 8), c.Date, truncate(c.Message, 80), c.Author)
+			}
+
+			fmt.Printf("\n📁 Files touched (%d):\n", len(impact.Files))
+			for _, f := range impact.Files {
+				fmt.Printf("  %s\n", f.FilePath)
+			}
+
+			fmt.Printf("\n⚙️  Functions/symbols affected (%d):\n", len(impact.Functions))
+			for _, fn := range impact.Functions {
+				fmt.Printf("  %s %s  (%s:%d)\n", fn.Type, fn.Name, fn.FilePath, fn.StartLine)
+			}
+			return nil
+		},
+	}
+}
+
+// --- graph function-history command ---
+
+func graphFunctionHistoryCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "function-history <name>",
+		Short: "Show git commit history for a function or method",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, g, _, _, err := loadDeps()
+			if err != nil {
+				return err
+			}
+			defer g.Close(context.Background())
+
+			histories, err := g.GetFunctionHistory(context.Background(), args[0])
+			if err != nil {
+				return err
+			}
+			if len(histories) == 0 {
+				fmt.Printf("No history found for function %q\n", args[0])
+				return nil
+			}
+
+			for _, h := range histories {
+				fn := h.Function
+				fmt.Printf("\n⚙️  %s %s  (%s:%d)\n", fn.Type, fn.Name, fn.FilePath, fn.StartLine)
+				if fn.Doc != "" {
+					fmt.Printf("   Doc: %s\n", truncate(fn.Doc, 120))
+				}
+				fmt.Printf("   Commits (%d):\n", len(h.Commits))
+				for _, c := range h.Commits {
+					fmt.Printf("     [%s] %s  %s  (%s)\n",
+						truncate(c.Hash, 8), c.Date, truncate(c.Message, 80), c.Author)
+				}
+			}
+			return nil
 		},
 	}
 }

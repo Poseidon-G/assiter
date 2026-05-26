@@ -53,11 +53,15 @@ func (c *Client) EnsureSchema(ctx context.Context) error {
 		"CREATE CONSTRAINT IF NOT EXISTS FOR (n:Import) REQUIRE n.id IS UNIQUE",
 
 		"CREATE CONSTRAINT IF NOT EXISTS FOR (n:Symbol) REQUIRE n.id IS UNIQUE",
+		"CREATE CONSTRAINT IF NOT EXISTS FOR (n:Commit) REQUIRE n.id IS UNIQUE",
+		"CREATE CONSTRAINT IF NOT EXISTS FOR (n:Ticket) REQUIRE n.id IS UNIQUE",
 
 		"CREATE INDEX IF NOT EXISTS FOR (n:Symbol) ON (n.name)",
 		"CREATE INDEX IF NOT EXISTS FOR (n:Method) ON (n.name)",
 		"CREATE INDEX IF NOT EXISTS FOR (n:Struct) ON (n.name)",
 		"CREATE INDEX IF NOT EXISTS FOR (n:Interface) ON (n.name)",
+		"CREATE INDEX IF NOT EXISTS FOR (n:Ticket) ON (n.name)",
+		"CREATE INDEX IF NOT EXISTS FOR (n:Commit) ON (n.date)",
 	}
 
 	for _, cql := range constraints {
@@ -130,7 +134,7 @@ func (c *Client) upsertNodesBatched(ctx context.Context, nodes []*umodel.Node) e
 			}
 			rows := make([]map[string]any, 0, end-i)
 			for _, n := range group[i:end] {
-				rows = append(rows, map[string]any{
+				row := map[string]any{
 					"id":        n.ID,
 					"name":      n.Name,
 					"language":  n.Language,
@@ -142,7 +146,12 @@ func (c *Client) upsertNodesBatched(ctx context.Context, nodes []*umodel.Node) e
 					"receiver":  n.Receiver,
 					"alias":     n.Alias,
 					"checksum":  n.Checksum,
-				})
+				}
+				// Merge extra properties (e.g. Commit hash/date/author/message) as top-level fields.
+				for k, v := range n.Properties {
+					row[k] = v
+				}
+				rows = append(rows, row)
 			}
 
 			// ON CREATE: write all props for new nodes.
@@ -195,6 +204,8 @@ func (c *Client) upsertEdgesBatched(ctx context.Context, edges []*umodel.Edge) e
 			UNWIND $rows AS row
 			MATCH (%s {id: row.fromId}), (%s {id: row.toId})
 			MERGE (a)-[r:%s]->(b)
+			ON CREATE SET r = row.props
+			ON MATCH SET r += row.props
 		`, fromMatch, toMatch, k.edgeType)
 
 		for i := 0; i < total; i += batchSize {
@@ -204,7 +215,18 @@ func (c *Client) upsertEdgesBatched(ctx context.Context, edges []*umodel.Edge) e
 			}
 			rows := make([]map[string]any, 0, end-i)
 			for _, e := range group[i:end] {
-				rows = append(rows, map[string]any{"fromId": e.FromID, "toId": e.ToID})
+				props := map[string]any{}
+				for k, v := range e.Properties {
+					props[k] = v
+				}
+				for k, v := range e.IntLists {
+					props[k] = v
+				}
+				rows = append(rows, map[string]any{
+					"fromId": e.FromID,
+					"toId":   e.ToID,
+					"props":  props,
+				})
 			}
 
 			session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
@@ -649,4 +671,216 @@ func (c *Client) GetNodeSubgraph(ctx context.Context, id string) (*VizGraph, err
 		vg.Edges = append(vg.Edges, &VizEdge{From: center.ID, To: n.ID, Label: nb.Relationship})
 	}
 	return vg, nil
+}
+
+// ── Git history queries ────────────────────────────────────────────────────
+
+// TicketImpact describes all functions/files touched by a ticket.
+type TicketImpact struct {
+	TicketID string         `json:"ticketId"`
+	Commits  []*CommitInfo  `json:"commits"`
+	Files    []*umodel.Node `json:"files"`
+	// Functions in files touched by this ticket (via File→Function edges).
+	Functions []*umodel.Node `json:"functions"`
+}
+
+// CommitInfo is a lightweight commit summary for API responses.
+type CommitInfo struct {
+	Hash    string `json:"hash"`
+	Date    string `json:"date"`
+	Author  string `json:"author"`
+	Message string `json:"message"`
+}
+
+// SearchByTicket searches commits by keyword — matches ticket IDs in the structured
+// Ticket nodes AND does a full-text substring match on commit messages directly.
+// This handles commits that mention "3581" as a ticket ID as well as commits whose
+// message simply contains a keyword but no structured ticket ID was extracted.
+func (c *Client) SearchByTicket(ctx context.Context, keyword string) (*TicketImpact, error) {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
+	defer session.Close(ctx)
+
+	// Union approach: collect commits via ticket nodes OR direct message match.
+	// Using a single query with OPTIONAL path to ticket + WHERE filter on message.
+	cqlCommits := `
+		MATCH (cm:Commit)
+		WHERE toLower(cm.message) CONTAINS toLower($kw)
+		   OR EXISTS {
+		       MATCH (cm)-[:MENTIONS_TICKET]->(t:Ticket)
+		       WHERE toLower(t.name) CONTAINS toLower($kw)
+		   }
+		RETURN cm.hash AS hash, cm.date AS date,
+		       cm.author AS author, cm.message AS message
+		ORDER BY cm.date DESC
+		LIMIT 50
+	`
+	res, err := session.Run(ctx, cqlCommits, map[string]any{"kw": keyword})
+	if err != nil {
+		return nil, err
+	}
+	impact := &TicketImpact{TicketID: keyword}
+	seenHash := map[string]bool{}
+	for res.Next(ctx) {
+		rec := res.Record()
+		get := func(k string) string {
+			v, _ := rec.Get(k)
+			if v == nil {
+				return ""
+			}
+			return fmt.Sprintf("%v", v)
+		}
+		h := get("hash")
+		if seenHash[h] {
+			continue
+		}
+		seenHash[h] = true
+		impact.Commits = append(impact.Commits, &CommitInfo{
+			Hash:    h,
+			Date:    get("date"),
+			Author:  get("author"),
+			Message: get("message"),
+		})
+	}
+	if err := res.Err(); err != nil {
+		return nil, err
+	}
+
+	// Files touched by matched commits
+	cqlFiles := `
+		MATCH (cm:Commit)<-[:HAS_COMMIT]-(f:File)
+		WHERE toLower(cm.message) CONTAINS toLower($kw)
+		   OR EXISTS {
+		       MATCH (cm)-[:MENTIONS_TICKET]->(t:Ticket)
+		       WHERE toLower(t.name) CONTAINS toLower($kw)
+		   }
+		RETURN DISTINCT f.id AS id, labels(f)[0] AS type, f.name AS name,
+		       f.language AS language, f.filePath AS filePath,
+		       f.startLine AS startLine, f.doc AS doc
+		LIMIT 100
+	`
+	res2, err := session.Run(ctx, cqlFiles, map[string]any{"kw": keyword})
+	if err != nil {
+		return nil, err
+	}
+	for res2.Next(ctx) {
+		impact.Files = append(impact.Files, recordToNode(res2.Record()))
+	}
+	if err := res2.Err(); err != nil {
+		return nil, err
+	}
+
+	// Functions: only those whose startLine–endLine overlaps the changed line ranges
+	// stored on the HAS_COMMIT edge. Falls back to all functions if no ranges recorded.
+	cqlFns := `
+		MATCH (cm:Commit)<-[hc:HAS_COMMIT]-(f:File)-[]->(fn)
+		WHERE (fn:Function OR fn:Method OR fn:Struct OR fn:Interface)
+		  AND (
+		    toLower(cm.message) CONTAINS toLower($kw)
+		    OR EXISTS {
+		        MATCH (cm)-[:MENTIONS_TICKET]->(t:Ticket)
+		        WHERE toLower(t.name) CONTAINS toLower($kw)
+		    }
+		  )
+		  AND (
+		    hc.changedRanges IS NULL
+		    OR size(hc.changedRanges) = 0
+		    OR ANY(i IN range(0, size(hc.changedRanges)-2, 2)
+		           WHERE hc.changedRanges[i] <= coalesce(fn.endLine, fn.startLine)
+		             AND hc.changedRanges[i+1] >= fn.startLine)
+		  )
+		RETURN DISTINCT fn.id AS id, labels(fn)[0] AS type, fn.name AS name,
+		       fn.language AS language, fn.filePath AS filePath,
+		       fn.startLine AS startLine, fn.doc AS doc
+		ORDER BY fn.filePath, fn.startLine
+		LIMIT 200
+	`
+	res3, err := session.Run(ctx, cqlFns, map[string]any{"kw": keyword})
+	if err != nil {
+		return nil, err
+	}
+	for res3.Next(ctx) {
+		impact.Functions = append(impact.Functions, recordToNode(res3.Record()))
+	}
+	return impact, res3.Err()
+}
+
+// FunctionHistory returns all commits that touched the file containing a function.
+type FunctionHistory struct {
+	Function *umodel.Node  `json:"function"`
+	Commits  []*CommitInfo `json:"commits"`
+}
+
+// GetFunctionHistory returns the git commit history for a named function/method.
+func (c *Client) GetFunctionHistory(ctx context.Context, name string) ([]*FunctionHistory, error) {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
+	defer session.Close(ctx)
+
+	cql := `
+		MATCH (fn)
+		WHERE (fn:Function OR fn:Method) AND toLower(fn.name) CONTAINS toLower($name)
+		WITH fn LIMIT 10
+		OPTIONAL MATCH (f:File {filePath: fn.filePath})-[:HAS_COMMIT]->(cm:Commit)
+		RETURN fn.id AS fnId, labels(fn)[0] AS fnType, fn.name AS fnName,
+		       fn.language AS fnLang, fn.filePath AS fnPath, fn.startLine AS fnLine,
+		       fn.doc AS fnDoc,
+		       cm.hash AS hash, cm.date AS date,
+		       cm.author AS author, cm.message AS message,
+		       cm.ticketIds AS ticketIds
+		ORDER BY date DESC
+	`
+	res, err := session.Run(ctx, cql, map[string]any{"name": name})
+	if err != nil {
+		return nil, err
+	}
+
+	// Group by function ID
+	type key = string
+	fnMap := map[key]*FunctionHistory{}
+	var order []key
+
+	for res.Next(ctx) {
+		rec := res.Record()
+		get := func(k string) string {
+			v, _ := rec.Get(k)
+			if v == nil { return "" }
+			return fmt.Sprintf("%v", v)
+		}
+		startLine := 0
+		if v, ok := rec.Get("fnLine"); ok {
+			if i, ok := v.(int64); ok { startLine = int(i) }
+		}
+		fnID := get("fnId")
+		if _, exists := fnMap[fnID]; !exists {
+			fnMap[fnID] = &FunctionHistory{
+				Function: &umodel.Node{
+					ID:        fnID,
+					Type:      umodel.NodeType(get("fnType")),
+					Name:      get("fnName"),
+					Language:  get("fnLang"),
+					FilePath:  get("fnPath"),
+					StartLine: startLine,
+					Doc:       get("fnDoc"),
+				},
+			}
+			order = append(order, fnID)
+		}
+		hash := get("hash")
+		if hash != "" {
+			fnMap[fnID].Commits = append(fnMap[fnID].Commits, &CommitInfo{
+				Hash:    hash,
+				Date:    get("date"),
+				Author:  get("author"),
+				Message: get("message"),
+			})
+		}
+	}
+	if err := res.Err(); err != nil {
+		return nil, err
+	}
+
+	result := make([]*FunctionHistory, 0, len(order))
+	for _, id := range order {
+		result = append(result, fnMap[id])
+	}
+	return result, nil
 }

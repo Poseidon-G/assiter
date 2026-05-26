@@ -521,3 +521,132 @@ func (c *Client) GetFileContext(ctx context.Context, filePath string) ([]*umodel
 	}
 	return nodes, result.Err()
 }
+
+// ── Visualization types ────────────────────────────────────────────────────
+
+// VizNode is a node shaped for vis-network rendering.
+type VizNode struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Group    string `json:"group"`
+	Title    string `json:"title"`
+	FilePath string `json:"filePath"`
+	Line     int    `json:"line"`
+}
+
+// VizEdge is an edge shaped for vis-network rendering.
+type VizEdge struct {
+	From  string `json:"from"`
+	To    string `json:"to"`
+	Label string `json:"label"`
+}
+
+// VizGraph is the payload consumed by the vis-network UI.
+type VizGraph struct {
+	Nodes []*VizNode `json:"nodes"`
+	Edges []*VizEdge `json:"edges"`
+}
+
+// GetSubgraph returns a vis-network subgraph centred on a name search (depth=1).
+func (c *Client) GetSubgraph(ctx context.Context, name string) (*VizGraph, error) {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
+	defer session.Close(ctx)
+
+	cql := `
+		MATCH (n)
+		WHERE toLower(n.name) CONTAINS toLower($name)
+		WITH n LIMIT 20
+		OPTIONAL MATCH (n)-[r]->(m)
+		RETURN n, collect({rel: type(r), node: m}) AS outs
+	`
+	result, err := session.Run(ctx, cql, map[string]any{"name": name})
+	if err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+	vg := &VizGraph{}
+
+	addVizNode := func(n neo4j.Node) {
+		u := neo4jNodeToUModel(n)
+		if u.ID == "" || seen[u.ID] {
+			return
+		}
+		seen[u.ID] = true
+		label := u.Name
+		if label == "" {
+			label = u.ID
+		}
+		vg.Nodes = append(vg.Nodes, &VizNode{
+			ID:       u.ID,
+			Label:    label,
+			Group:    string(u.Type),
+			Title:    fmt.Sprintf("%s\n%s:%d", u.Type, u.FilePath, u.StartLine),
+			FilePath: u.FilePath,
+			Line:     u.StartLine,
+		})
+	}
+
+	for result.Next(ctx) {
+		rec := result.Record()
+		nv, _ := rec.Get("n")
+		n, ok := nv.(neo4j.Node)
+		if !ok {
+			continue
+		}
+		addVizNode(n)
+		centerID := fmt.Sprintf("%v", n.Props["id"])
+
+		if outs, ok := rec.Get("outs"); ok {
+			if list, ok := outs.([]any); ok {
+				for _, item := range list {
+					if m, ok := item.(map[string]any); ok {
+						rel, _ := m["rel"].(string)
+						if nbNode, ok := m["node"].(neo4j.Node); ok {
+							addVizNode(nbNode)
+							toID := fmt.Sprintf("%v", nbNode.Props["id"])
+							if centerID != "" && toID != "" && toID != "<nil>" {
+								vg.Edges = append(vg.Edges, &VizEdge{From: centerID, To: toID, Label: rel})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return vg, result.Err()
+}
+
+// GetNodeSubgraph returns a vis-network subgraph for a single node and its neighbours.
+func (c *Client) GetNodeSubgraph(ctx context.Context, id string) (*VizGraph, error) {
+	nwn, err := c.GetNodeWithNeighbors(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	vg := &VizGraph{}
+	center := nwn.Center
+	vg.Nodes = append(vg.Nodes, &VizNode{
+		ID:       center.ID,
+		Label:    center.Name,
+		Group:    string(center.Type),
+		Title:    fmt.Sprintf("%s\n%s:%d", center.Type, center.FilePath, center.StartLine),
+		FilePath: center.FilePath,
+		Line:     center.StartLine,
+	})
+	for _, nb := range nwn.Neighbors {
+		n := nb.Node
+		if n == nil || n.ID == "" {
+			continue
+		}
+		vg.Nodes = append(vg.Nodes, &VizNode{
+			ID:       n.ID,
+			Label:    n.Name,
+			Group:    string(n.Type),
+			Title:    fmt.Sprintf("%s\n%s:%d", n.Type, n.FilePath, n.StartLine),
+			FilePath: n.FilePath,
+			Line:     n.StartLine,
+		})
+		vg.Edges = append(vg.Edges, &VizEdge{From: center.ID, To: n.ID, Label: nb.Relationship})
+	}
+	return vg, nil
+}

@@ -257,6 +257,60 @@ func registerTools(s *server.MCPServer, g *graph.Client, pipe *ingestion.Pipelin
 			return mcp.NewToolResultText(sb.String()), nil
 		},
 	)
+
+	// ── graph_diagram ────────────────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("graph_diagram",
+			mcp.WithDescription("Generate a Mermaid flowchart diagram for a symbol search. "+
+				"GitHub Copilot Chat renders Mermaid diagrams inline. "+
+				"Use this to visually understand relationships around a symbol."),
+			mcp.WithString("name",
+				mcp.Required(),
+				mcp.Description("Symbol name to visualize (partial match)"),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name := req.GetString("name", "")
+			if name == "" {
+				return mcp.NewToolResultError("name is required"), nil
+			}
+			vg, err := g.GetSubgraph(ctx, name)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if len(vg.Nodes) == 0 {
+				return mcp.NewToolResultText("No nodes found for \"" + name + "\". Run ingest first."), nil
+			}
+			return mcp.NewToolResultText(toMermaid(vg)), nil
+		},
+	)
+}
+
+// toMermaid converts a VizGraph to a Mermaid LR flowchart string.
+func toMermaid(vg *graph.VizGraph) string {
+	var sb strings.Builder
+	sb.WriteString("```mermaid\nflowchart LR\n")
+
+	for _, n := range vg.Nodes {
+		label := strings.ReplaceAll(n.Label, "\"", "'")
+		sb.WriteString(fmt.Sprintf("  %s[\"%s\\n%s\"]\n",
+			sanitizeID(n.ID), label, n.Group))
+	}
+	for _, e := range vg.Edges {
+		sb.WriteString(fmt.Sprintf("  %s -->|%s| %s\n",
+			sanitizeID(e.From), e.Label, sanitizeID(e.To)))
+	}
+	sb.WriteString("```")
+	return sb.String()
+}
+
+// sanitizeID makes a Neo4j hash ID safe for Mermaid node identifiers.
+func sanitizeID(id string) string {
+	// Mermaid IDs can't contain spaces or special chars — use first 8 chars of hash.
+	if len(id) > 8 {
+		return "n" + id[:8]
+	}
+	return "n" + id
 }
 
 // jsonResult marshals v to pretty JSON and returns it as a tool text result.

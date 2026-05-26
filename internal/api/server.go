@@ -40,7 +40,13 @@ func (s *Server) registerRoutes() {
 	s.router.GET("/graph/search", s.searchGraph)
 	s.router.GET("/graph/node/:id", s.getNode)
 	s.router.GET("/graph/stats", s.graphStats)
+	s.router.GET("/graph/subgraph", s.subgraph)
+	s.router.GET("/graph/subgraph/node/:id", s.nodeSubgraph)
 	s.router.POST("/agent/query", s.agentQuery)
+
+	// Interactive visualization UI
+	s.router.GET("/ui", s.vizUI)
+	s.router.GET("/", func(c *gin.Context) { c.Redirect(http.StatusFound, "/ui") })
 }
 
 // Run starts the HTTP server.
@@ -133,4 +139,33 @@ func (s *Server) agentQuery(c *gin.Context) {
 
 func itoa(n int) string {
 	return fmt.Sprintf("%d", n)
+}
+
+func (s *Server) subgraph(c *gin.Context) {
+	name := c.Query("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name query param required"})
+		return
+	}
+	vg, err := s.graph.GetSubgraph(c.Request.Context(), name)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, vg)
+}
+
+func (s *Server) nodeSubgraph(c *gin.Context) {
+	id := c.Param("id")
+	vg, err := s.graph.GetNodeSubgraph(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, vg)
+}
+
+func (s *Server) vizUI(c *gin.Context) {
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.String(http.StatusOK, vizHTML)
 }

@@ -36,3 +36,9 @@ parser:
     - build
     - __pycache__
     - target
+
+# MCP server preload: auto-ingest a directory when `assiter-mcp` starts.
+# Leave dir empty to disable preload (ingest manually using the `ingest` tool).
+preload:
+  dir: ""      # e.g. /home/user/myproject/src
+  force: false # true = re-ingest even if files haven't changed

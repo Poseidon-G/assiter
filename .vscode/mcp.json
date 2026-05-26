@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "assiter": {
+      "type": "stdio",
+      "command": "/home/quyenluc/MyHome/Assiter/assiter-mcp",
+      "args": ["--config", "/home/quyenluc/MyHome/Assiter/assiter.yaml"],
+      "env": {}
+    }
+  }
+}

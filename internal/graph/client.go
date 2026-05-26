@@ -496,3 +496,28 @@ func neo4jNodeToUModel(n neo4j.Node) *umodel.Node {
 		Doc:       get("doc"),
 	}
 }
+
+// GetFileContext returns all symbols (functions, methods, structs, interfaces, variables)
+// defined inside a given file path, ordered by start line.
+func (c *Client) GetFileContext(ctx context.Context, filePath string) ([]*umodel.Node, error) {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: c.db})
+	defer session.Close(ctx)
+
+	cql := `
+		MATCH (f:File {filePath: $path})-[]->(n)
+		WHERE n.filePath = $path AND NOT n:File
+		RETURN n.id AS id, labels(n)[0] AS type, n.name AS name,
+		       n.language AS language, n.filePath AS filePath,
+		       n.startLine AS startLine, n.doc AS doc
+		ORDER BY n.startLine
+	`
+	result, err := session.Run(ctx, cql, map[string]any{"path": filePath})
+	if err != nil {
+		return nil, err
+	}
+	var nodes []*umodel.Node
+	for result.Next(ctx) {
+		nodes = append(nodes, recordToNode(result.Record()))
+	}
+	return nodes, result.Err()
+}

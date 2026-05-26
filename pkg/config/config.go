@@ -10,10 +10,11 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	Server ServerConfig `mapstructure:"server"`
-	Neo4j  Neo4jConfig  `mapstructure:"neo4j"`
-	LLM    LLMConfig    `mapstructure:"llm"`
-	Parser ParserConfig `mapstructure:"parser"`
+	Server  ServerConfig  `mapstructure:"server"`
+	Neo4j   Neo4jConfig   `mapstructure:"neo4j"`
+	LLM     LLMConfig     `mapstructure:"llm"`
+	Parser  ParserConfig  `mapstructure:"parser"`
+	Preload PreloadConfig `mapstructure:"preload"`
 }
 
 type ServerConfig struct {
@@ -46,6 +47,12 @@ type LLMConfig struct {
 type ParserConfig struct {
 	Languages []string `mapstructure:"languages"`
 	Exclude   []string `mapstructure:"exclude"`
+}
+
+// PreloadConfig optionally auto-ingests a directory when the MCP server starts.
+type PreloadConfig struct {
+	Dir   string `mapstructure:"dir"`   // path to ingest on startup; empty = disabled
+	Force bool   `mapstructure:"force"` // ignore checksums and re-ingest everything
 }
 
 // Load reads config from the given file path and overlays environment variables.
